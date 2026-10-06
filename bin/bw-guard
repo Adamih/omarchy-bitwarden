@@ -1,0 +1,63 @@
+#!/bin/bash
+# Locks the rbw vault when the screen locks or the system is about to sleep.
+# Runs for as long as the shell's Bitwarden service does.
+#
+# Sleep: holds a logind delay inhibitor, so suspend waits until the vault is
+# locked, then releases it and takes a new one after resume.
+# Screen lock: third-party plugins can't subscribe to the lock screen, so this
+# asks the shell every 2s, but only while rbw-agent is running. The 2s wait is
+# the read timeout on logind's signal stream, so idling costs no processes.
+
+set -uo pipefail
+
+plugin_dir=$(cd "$(dirname "$0")/.." && pwd)
+source "$plugin_dir/bin/bw-common"
+
+# Never starts the agent. Bounded, so a wedged agent can't hold up suspend.
+lock_vault() {
+  agent_running || return 0
+  timeout --kill-after=1s 3s rbw lock >/dev/null 2>&1
+}
+
+# The inhibitor lasts as long as cat reads from this fd; closing it releases it.
+inhibitor=""
+take_inhibitor() {
+  [[ -n $inhibitor ]] && return
+  exec {inhibitor}> >(exec systemd-inhibit --what=sleep --mode=delay --who=Bitwarden \
+    --why="Locking the Bitwarden vault" cat >/dev/null)
+}
+release_inhibitor() {
+  [[ -n $inhibitor ]] || return
+  exec {inhibitor}>&-
+  inhibitor=""
+}
+
+exec {signals}< <(exec gdbus monitor --system --dest org.freedesktop.login1 \
+  --object-path /org/freedesktop/login1)
+monitor_pid=$!
+trap 'release_inhibitor; kill "$monitor_pid" 2>/dev/null' EXIT
+trap 'exit 0' TERM INT HUP
+
+take_inhibitor
+screen_locked=false
+
+while true; do
+  if read -r -t 2 -u "$signals" line; then
+    case $line in
+      *PrepareForSleep*true*) lock_vault; release_inhibitor ;;
+      *PrepareForSleep*false*) take_inhibitor ;;
+    esac
+  elif (( $? <= 128 )); then
+    # The signal stream ended; exit so the service restarts this.
+    exit 1
+  fi
+
+  if agent_running; then
+    now=false
+    [[ $(omarchy-shell lock isLocked 2>/dev/null) == "true" ]] && now=true
+    [[ $now == true && $screen_locked == false ]] && lock_vault
+    screen_locked=$now
+  else
+    screen_locked=false
+  fi
+done

@@ -1,0 +1,216 @@
+#!/bin/bash
+# Actions behind the Bitwarden panel's buttons. Each prints a one-line result on
+# success, or an error on stderr and exits non-zero. Secrets are never handled
+# here: rbw asks for them itself through pinentry.
+
+set -uo pipefail
+
+plugin_dir=$(cd "$(dirname "$0")/.." && pwd)
+source "$plugin_dir/bin/bw-common"
+
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
+# rbw's errors look like "rbw login: <reason>"; keep the last line.
+run_rbw() {
+  local err
+  err=$(rbw "$@" 2>&1 >/dev/null) && return 0
+  fail "$(tail -n1 <<<"$err")"
+}
+
+config_email() {
+  rbw config show 2>/dev/null | jq -r '.email // ""'
+}
+
+vault_url() {
+  local base
+  base=$(rbw config show 2>/dev/null | jq -r '.base_url // ""')
+  case ${base%/} in
+    "") echo "https://vault.bitwarden.com" ;;
+    https://api.bitwarden.eu) echo "https://vault.bitwarden.eu" ;;
+    *) echo "${base%/}" ;;
+  esac
+}
+
+# Sets an rbw option only while it still has rbw's default value, so settings
+# someone chose themselves are kept. Prints the option's name if it was kept.
+set_unless_customized() {
+  local key=$1 default=$2 value=$3 current
+  current=$(rbw config show 2>/dev/null | jq -r --arg k "$key" '.[$k] // "" | tostring')
+  if [[ -z $current || $current == "$default" || $current == "$value" ]]; then
+    run_rbw config set "$key" "$value"
+  else
+    echo "$key"
+  fi
+}
+
+# Drops the plugin's block and the blank line written before it.
+remove_keybind() {
+  local tmp
+  tmp=$(mktemp "$bindings.XXXXXX") || return 1
+  awk '
+    /^-- omarchy-bitwarden: begin$/ { skip = 1; blank = 0; next }
+    skip { if (/^-- omarchy-bitwarden: end$/) skip = 0; next }
+    /^$/ { if (blank) print ""; blank = 1; next }
+    { if (blank) print ""; blank = 0; print }
+    END { if (blank) print "" }
+  ' "$bindings" >"$tmp" && cat "$tmp" >"$bindings"
+  local status=$?
+  rm -f "$tmp"
+  return $status
+}
+
+append_keybind() {
+  cat >>"$bindings" <<'EOF'
+
+-- omarchy-bitwarden: begin
+-- Managed by the Bitwarden plugin. Remove it from the plugin's panel, or with
+-- ~/.config/omarchy/plugins/adami.bitwarden/bin/bw-setup keybind-remove
+o.bind("SUPER + ALT + P", "Passwords", "omarchy-shell -q adami.bitwarden-vault menu")
+-- omarchy-bitwarden: end
+EOF
+}
+
+config_errors() {
+  hyprctl configerrors 2>/dev/null | sed '/^[[:space:]]*$/d' | sort
+}
+
+# Edits bindings.lua with the given function and reloads Hyprland. If the edit
+# adds config errors, the original is put back. Errors that were there before
+# the edit don't count against it.
+edit_bindings() {
+  local edit=$1 backup before after
+  [[ -f $bindings ]] || fail "$bindings not found"
+  backup=$(mktemp "$bindings.bak.XXXXXX") && cp "$bindings" "$backup" || fail "Could not back up $bindings"
+  before=$(config_errors)
+
+  if ! $edit; then
+    cp "$backup" "$bindings"
+    rm -f "$backup"
+    fail "Could not edit $bindings"
+  fi
+
+  hyprctl reload >/dev/null
+  after=$(config_errors)
+  if [[ $after != "$before" ]]; then
+    cp "$backup" "$bindings"
+    rm -f "$backup"
+    hyprctl reload >/dev/null
+    fail "Hyprland rejected the change, so it was undone: $(comm -13 <(echo "$before") <(echo "$after") | head -n1)"
+  fi
+  rm -f "$backup"
+}
+
+# What SUPER + ALT + P (modmask 72) is bound to, if anything.
+shortcut_owner() {
+  hyprctl binds -j 2>/dev/null | jq -r '
+    map(select(.modmask == 72 and (.key | ascii_upcase) == "P")) | first
+    | if . == null then empty else (.description | select(. != "")) // .dispatcher end'
+}
+
+case ${1:-} in
+  install)
+    mapfile -t packages < <(missing_packages)
+    (( ${#packages[@]} )) || { echo "Everything is already installed"; exit 0; }
+    # The shell's polkit agent shows the password dialog.
+    pkexec pacman -S --needed --noconfirm "${packages[@]}" >/dev/null 2>&1 ||
+      fail "Installing ${packages[*]} was cancelled or failed"
+    echo "Installed ${packages[*]}"
+    ;;
+
+  account)
+    email=${2:-}
+    server=${3:-}
+    [[ $email == *@* ]] || fail "Enter the email address of your Bitwarden account"
+    case $server in
+      "" | com) base_url="" ;;
+      eu) base_url="https://api.bitwarden.eu" ;;   # rbw special-cases this exact URL
+      https://*) base_url="$server" ;;
+      *) fail "Self-hosted server URL must start with https://" ;;
+    esac
+
+    # Switching account or server: drop the previous account's local vault
+    # copy and tokens, which the plugin couldn't use anymore anyway.
+    old_email=$(config_email)
+    old_base=$(rbw config show 2>/dev/null | jq -r '.base_url // ""')
+    switched=false
+    if [[ -n $old_email && ( $old_email != "$email" || ${old_base%/} != "${base_url%/}" ) ]] &&
+       "$plugin_dir/bin/bw-status" | jq -e '.loggedIn' >/dev/null; then
+      rbw stop-agent >/dev/null 2>&1
+      rbw purge >/dev/null 2>&1 && switched=true
+    fi
+
+    run_rbw config set email "$email"
+    if [[ -n $base_url ]]; then
+      run_rbw config set base_url "$base_url"
+    else
+      rbw config unset base_url >/dev/null 2>&1
+    fi
+
+    # A graphical prompt, and locking and syncing every 15 minutes, unless
+    # these were already changed from rbw's defaults.
+    kept=$(
+      set_unless_customized pinentry pinentry pinentry-qt
+      set_unless_customized lock_timeout 3600 900
+      set_unless_customized sync_interval 3600 900
+    ) || exit 1
+
+    # The agent reads the config at startup.
+    rbw stop-agent >/dev/null 2>&1
+    msg="Account saved"
+    $switched && msg+=". The previous account's vault copy was removed"
+    [[ -n $kept ]] && msg+=". Kept your own rbw settings for $(paste -sd, <<<"$kept" | sed 's/,/, /g')"
+    echo "$msg"
+    ;;
+
+  api-key-page)
+    omarchy-launch-browser "$(vault_url)/#/settings/security/security-keys" >/dev/null 2>&1 &
+    echo "Opened the web vault. Use \"View API key\" there."
+    ;;
+
+  register)
+    email=$(config_email)
+    [[ -n $email ]] || fail "Save your account first"
+    run_rbw register
+    mkdir -p "$state_dir"
+    touch "$state_dir/registered-$email"
+    echo "Device registered"
+    ;;
+
+  login)
+    run_rbw login
+    run_rbw sync
+    echo "Logged in and synced"
+    ;;
+
+  unlock) run_rbw unlock && echo "Vault unlocked" ;;
+  lock)   run_rbw lock && echo "Vault locked" ;;
+  sync)   run_rbw sync && echo "Vault synced" ;;
+
+  logout)
+    # Removes the local vault copy and tokens; config and registration stay.
+    rbw stop-agent >/dev/null 2>&1
+    run_rbw purge
+    echo "Logged out"
+    ;;
+
+  keybind-add)
+    has_keybind && { echo "Shortcut already added"; exit 0; }
+    owner=$(shortcut_owner)
+    [[ -z $owner ]] || fail "SUPER + ALT + P is already bound to \"$owner\". Free it in $bindings first"
+    edit_bindings append_keybind
+    echo "SUPER+ALT+P now opens your vault"
+    ;;
+
+  keybind-remove)
+    has_keybind || { echo "Shortcut not present"; exit 0; }
+    edit_bindings remove_keybind
+    echo "Shortcut removed"
+    ;;
+
+  *)
+    fail "usage: bw-setup install|account EMAIL SERVER|api-key-page|register|login|unlock|lock|sync|logout|keybind-add|keybind-remove"
+    ;;
+esac

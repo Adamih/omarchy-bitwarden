@@ -1,0 +1,81 @@
+#!/bin/bash
+# Print the plugin's view of rbw as one JSON object for the bar panel.
+# Read-only: never prompts, unlocks, or starts rbw-agent.
+
+set -uo pipefail
+
+plugin_dir=$(cd "$(dirname "$0")/.." && pwd)
+source "$plugin_dir/bin/bw-common"
+
+installed=false email="" base_url="" logged_in=false unlocked=false items=0
+
+mapfile -t missing_list < <(missing_packages)
+missing=""
+(( ${#missing_list[@]} )) && missing=$(printf '"%s",' "${missing_list[@]}")
+missing="[${missing%,}]"
+
+# Everything below needs jq, so without it report only what to install.
+if ! command -v jq >/dev/null; then
+  printf '{"installed":false,"missing":%s,"email":"","baseUrl":"","official":true,"registered":false,"loggedIn":false,"unlocked":false,"items":0,"keybind":false}\n' "$missing"
+  exit 0
+fi
+
+if command -v rbw >/dev/null; then
+  if cfg=$(rbw config show 2>/dev/null); then
+    email=$(jq -r '.email // ""' <<<"$cfg")
+    base_url=$(jq -r '.base_url // ""' <<<"$cfg")
+  fi
+
+  # An unlocked vault is proof of a login; ask rbw only when its agent is
+  # already running, so this never starts it.
+  if agent_running && rbw unlocked >/dev/null 2>&1; then
+    unlocked=true
+    logged_in=true
+  fi
+
+  # When locked, rbw has no command that says whether you're logged in, so read
+  # its cache: <server>:<email>.json, where <server> is base_url (or "default")
+  # with %, / and : percent-encoded, holding tokens once logged in. This is rbw's
+  # internal layout (checked against rbw 1.15). If it changes, a locked vault
+  # shows as logged out and the panel's Log in button unlocks it. Matching the
+  # configured server keeps a leftover file from another server from counting.
+  # The entry count needs no decryption.
+  if [[ -n $email ]]; then
+    server=${base_url:-default}
+    server=${server//%/%25}
+    server=${server//\//%2F}
+    server=${server//:/%3A}
+    db="${XDG_CACHE_HOME:-$HOME/.cache}/rbw${RBW_PROFILE:+-$RBW_PROFILE}/$server:$email.json"
+    if [[ -f $db ]] && jq -e '.access_token != null' "$db" >/dev/null 2>&1; then
+      logged_in=true
+      items=$(jq '.entries | length' "$db" 2>/dev/null || echo 0)
+    elif $unlocked; then
+      items=$(rbw list 2>/dev/null | wc -l)
+    fi
+  fi
+fi
+
+(( ${#missing_list[@]} == 0 )) && installed=true
+
+registered=false
+[[ -n $email && -f "$state_dir/registered-$email" ]] && registered=true
+
+# Device registration is only needed on Bitwarden's own servers.
+official=false
+[[ -z $base_url || ${base_url%/} == https://api.bitwarden.eu ]] && official=true
+
+keybind=false
+has_keybind && keybind=true
+
+jq -cn \
+  --argjson installed "$installed" \
+  --argjson missing "$missing" \
+  --arg email "$email" \
+  --arg baseUrl "$base_url" \
+  --argjson official "$official" \
+  --argjson registered "$registered" \
+  --argjson loggedIn "$logged_in" \
+  --argjson unlocked "$unlocked" \
+  --argjson items "$items" \
+  --argjson keybind "$keybind" \
+  '$ARGS.named'

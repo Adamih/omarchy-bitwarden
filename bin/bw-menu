@@ -1,0 +1,115 @@
+#!/bin/bash
+# Pick a Bitwarden vault item from the Omarchy menu and copy a field from it.
+# Secrets are copied as sensitive (skipped by Omarchy's clipboard history) and
+# cleared after BW_CLEAR_SECONDS if the clipboard still holds that exact copy.
+
+set -uo pipefail
+
+CLEAR_SECONDS=${BW_CLEAR_SECONDS:-30}
+
+notify() {
+  omarchy notification send --app-name Bitwarden -g "󰞀" -t 3000 "$@" >/dev/null 2>&1 || true
+}
+
+die() {
+  notify -u critical "Bitwarden" "$1"
+  exit 1
+}
+
+# Until setup is finished, send the user to the bar panel that walks through it.
+if ! "$(dirname "$0")/bw-status" | jq -e '.loggedIn' >/dev/null; then
+  omarchy-shell -q adami.bitwarden open
+  exit 0
+fi
+
+# Unlocking prompts through rbw's pinentry. Cancelling it ends here.
+rbw unlocked >/dev/null 2>&1 || rbw unlock >/dev/null 2>&1 || exit 0
+
+# Build menu rows: "<glyph>\t<name>\t<subtext>". The menu returns
+# "<name>\t<subtext>", so each key must be unique to map back to an item id.
+declare -A ids
+rows=("󰑐	Sync vault	Fetch latest changes" "󰌾	Lock vault	Forget the unlock key")
+
+# rbw separates fields with tabs and doesn't escape tabs inside them, so name
+# goes last: read gives the last variable the rest of the line. Split on \037,
+# since tab is IFS whitespace and empty fields would collapse.
+while IFS=$'\037' read -r id user folder name; do
+  [[ -z $id ]] && continue
+  name=${name//$'\037'/ }
+  sub=${user:-—}
+  [[ -n $folder ]] && sub="$sub · $folder"
+  key="$name"$'\t'"$sub"
+  n=2
+  while [[ -n ${ids[$key]:-} ]]; do
+    key="$name"$'\t'"$sub ($n)"
+    ((n++))
+  done
+  ids[$key]=$id
+  rows+=("󰌆	$key")
+done < <(rbw list --fields id,user,folder,name 2>/dev/null | sort -t$'\t' -k4f | tr '\t' '\037')
+
+choice=$(omarchy-menu-select "Vault" "${rows[@]}") || exit 0
+
+case $choice in
+  "Sync vault"$'\t'*)
+    if rbw sync 2>/dev/null; then notify "Vault synced"; else die "Sync failed"; fi
+    exit 0 ;;
+  "Lock vault"$'\t'*)
+    rbw lock && notify "Vault locked"
+    exit 0 ;;
+esac
+
+id=${ids[$choice]:-}
+[[ -n $id ]] || die "Could not resolve the selected item"
+name=${choice%%$'\t'*}
+
+# Offer only the fields this item actually has.
+item=$(rbw get --raw "$id" 2>/dev/null) || die "Could not read \"$name\""
+has() { jq -e "$1 // empty | select(. != \"\")" >/dev/null <<<"$item"; }
+
+actions=()
+has '.data.password' && actions+=("󰟵	Password")
+has '.data.username' && actions+=("󰀄	Username")
+has '.data.totp'     && actions+=("󰔟	TOTP code")
+has '.notes'         && actions+=("󰎞	Notes")
+unset item
+(( ${#actions[@]} )) || die "\"$name\" has nothing to copy"
+
+action=$(omarchy-menu-select "$name" "${actions[@]}") || exit 0
+
+case $action in
+  Password)    value=$(rbw get "$id" 2>/dev/null) ;;
+  Username)    value=$(rbw get --raw "$id" 2>/dev/null | jq -r '.data.username // empty') ;;
+  "TOTP code") value=$(rbw code "$id" 2>/dev/null) ;;
+  Notes)       value=$(rbw get --raw "$id" 2>/dev/null | jq -r '.notes // empty') ;;
+  *)           exit 0 ;;
+esac
+
+[[ -n ${value:-} ]] || die "Could not copy $action for \"$name\""
+
+# printf is a builtin, so the secret never appears in a process argv.
+printf '%s' "$value" | wl-copy --sensitive --trim-newline || die "Clipboard copy failed"
+
+# The timer that clears the copy keeps a salted hash of it, not the secret.
+# The salt keeps a weak password from being guessed back from the hash.
+salt=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+fingerprint() { sha256sum | cut -d' ' -f1; }
+hash=$(printf '%s%s' "$salt" "$value" | fingerprint)
+unset value
+
+notify "$action copied" "$name · clears in ${CLEAR_SECONDS}s"
+
+# Clear only if this is still the newest copy from this menu and the clipboard
+# still holds exactly what was copied. Anything copied since, including a
+# password from elsewhere, is left alone, and copying the same secret again
+# restarts its time.
+token_file="${XDG_RUNTIME_DIR:-/tmp}/omarchy-bitwarden-clip-$UID"
+token="$$-$EPOCHREALTIME"
+printf '%s' "$token" >"$token_file"
+(
+  sleep "$CLEAR_SECONDS"
+  [[ $(cat "$token_file" 2>/dev/null) == "$token" ]] || exit 0
+  current=$({ printf '%s' "$salt"; wl-paste --type text --no-newline 2>/dev/null; } | fingerprint)
+  [[ $current == "$hash" ]] && wl-copy --clear
+) >/dev/null 2>&1 &
+disown

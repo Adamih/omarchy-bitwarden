@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "adami.bitwarden",
+  "name": "Bitwarden",
+  "version": "0.1.0",
+  "author": "Adam Henriksson",
+  "license": "MIT",
+  "description": "Use your Bitwarden vault from Omarchy without the Bitwarden desktop app, via the unofficial rbw client. Not affiliated with Bitwarden, Inc.",
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Bitwarden",
+    "description": "Guided setup, vault lock state, and quick unlock, lock, sync and search.",
+    "category": "System",
+    "aliases": ["bitwarden", "passwords", "vault", "rbw"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}
